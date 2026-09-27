@@ -1,0 +1,84 @@
+# Basic VM configuration
+resource "libvirt_domain" "example" {
+  name   = "example-vm"
+  memory = 2048
+  memory_unit   = "MiB"
+  vcpu   = 2
+  type   = "kvm"
+
+  os = {
+    type         = "hvm"
+    type_arch    = "x86_64"
+    type_machine = "q35"
+    boot_devices = ["hd", "network"]
+  }
+
+  devices = {
+    disks = [
+      {
+        source = {
+          file = {
+            file = "/var/lib/libvirt/images/example.qcow2"
+          }
+        }
+        target = {
+          dev = "vda"
+          bus = "virtio"
+        }
+      }
+    ]
+    interfaces = [
+      {
+        model = {
+          type = "virtio"
+        }
+        source = {
+          network = {
+            network = "default"
+          }
+        }
+      }
+    ]
+  }
+}
+
+# VM with UEFI firmware
+resource "libvirt_domain" "uefi_example" {
+  name   = "uefi-vm"
+  memory = 4096
+  memory_unit   = "MiB"
+  vcpu   = 4
+  type   = "kvm"
+
+  os = {
+    type             = "hvm"
+    type_arch        = "x86_64"
+    type_machine     = "q35"
+    firmware         = "efi"
+    loader           = "/usr/share/edk2/x64/OVMF_CODE.secboot.4m.fd"
+    loader_readonly  = true
+    loader_type      = "pflash"
+    nv_ram = {
+      nv_ram   = "/var/lib/libvirt/qemu/nvram/uefi-vm.fd"
+      template = "/usr/share/edk2/x64/OVMF_VARS.4m.fd"
+    }
+    boot_devices     = ["hd"]
+  }
+}
+
+# VM with direct kernel boot
+resource "libvirt_domain" "kernel_boot" {
+  name   = "kernel-boot-vm"
+  memory = 1024
+  memory_unit   = "MiB"
+  vcpu   = 1
+  type   = "kvm"
+
+  os = {
+    type         = "hvm"
+    type_arch    = "x86_64"
+    kernel       = "/boot/vmlinuz"
+    initrd       = "/boot/initrd.img"
+    kernel_args  = "console=ttyS0 root=/dev/vda1"
+  }
+}
