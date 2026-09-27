@@ -2,11 +2,9 @@
 
 A hands-on Terraform, libvirt, QEMU/KVM, cloud-init, and Ansible inventory lab on Arch Linux.
 
-The VM infrastructure design is based on:
 
-https://git.batsense.net/realaravinth/libreddit-loadbalance-demo
 
-The reference project uses an older libvirt provider. This lab adapts the VM, networking, cloud-init, and inventory approach to:
+This lab adapts the VM, networking, cloud-init, and inventory approach to:
 
 - Terraform
 - dmacvicar/libvirt 0.9.9
