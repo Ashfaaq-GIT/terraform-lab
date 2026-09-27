@@ -11,6 +11,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/listplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
@@ -30,6 +31,7 @@ type NWFilterResourceModel struct {
 	Name     types.String `tfsdk:"name"`
 	Chain    types.String `tfsdk:"chain"`
 	Priority types.Int64  `tfsdk:"priority"`
+	Entries  types.List   `tfsdk:"entries"`
 }
 
 func NewNWFilterResource() resource.Resource {
@@ -78,6 +80,50 @@ func (r *NWFilterResource) Schema(
 				Optional:    true,
 				PlanModifiers: []planmodifier.Int64{
 					int64planmodifier.RequiresReplace(),
+				},
+			},
+
+			"entries": schema.ListNestedAttribute{
+				Description: "Ordered network filter entries. Iteration 1 supports ICMP rules.",
+				Optional:    true,
+				PlanModifiers: []planmodifier.List{
+					listplanmodifier.RequiresReplace(),
+				},
+				NestedObject: schema.NestedAttributeObject{
+					Attributes: map[string]schema.Attribute{
+						"rule": schema.SingleNestedAttribute{
+							Description: "Network filter rule.",
+							Required:    true,
+							Attributes: map[string]schema.Attribute{
+								"action": schema.StringAttribute{
+									Description: "Rule action, such as accept or drop.",
+									Required:    true,
+								},
+								"direction": schema.StringAttribute{
+									Description: "Rule direction, such as in or out.",
+									Required:    true,
+								},
+								"priority": schema.Int64Attribute{
+									Description: "Optional rule priority.",
+									Optional:    true,
+								},
+								"icmp": schema.SingleNestedAttribute{
+									Description: "ICMP match criteria.",
+									Required:    true,
+									Attributes: map[string]schema.Attribute{
+										"type": schema.Int64Attribute{
+											Description: "ICMP type.",
+											Required:    true,
+										},
+										"code": schema.Int64Attribute{
+											Description: "ICMP code.",
+											Required:    true,
+										},
+									},
+								},
+							},
+						},
+					},
 				},
 			},
 		},
@@ -129,6 +175,17 @@ func (r *NWFilterResource) Create(
 		filterXML.Priority = int(model.Priority.ValueInt64())
 	}
 
+	entries, err := nwFilterEntriesFromModel(model)
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Network Filter Entry Conversion Failed",
+			fmt.Sprintf("Failed to convert network filter entries: %s", err),
+		)
+		return
+	}
+
+	filterXML.Entries = entries
+
 	xmlDoc, err := filterXML.Marshal()
 	if err != nil {
 		resp.Diagnostics.AddError(
@@ -164,6 +221,132 @@ func (r *NWFilterResource) Create(
 // Read/refresh will be completed by Person 2.
 // Keeping the existing state unchanged is sufficient for Person 1's
 // initial Create/Delete implementation.
+func nwFilterEntriesFromModel(model NWFilterResourceModel) ([]libvirtxml.NWFilterEntry, error) {
+	if model.Entries.IsNull() || model.Entries.IsUnknown() {
+		return nil, nil
+	}
+
+	entries := make([]libvirtxml.NWFilterEntry, 0, len(model.Entries.Elements()))
+
+	for i, entryValue := range model.Entries.Elements() {
+		entryObject, ok := entryValue.(types.Object)
+		if !ok {
+			return nil, fmt.Errorf("entry %d is not an object", i)
+		}
+
+		ruleValue, ok := entryObject.Attributes()["rule"]
+		if !ok {
+			return nil, fmt.Errorf("entry %d does not contain a rule", i)
+		}
+
+		ruleObject, ok := ruleValue.(types.Object)
+		if !ok || ruleObject.IsNull() || ruleObject.IsUnknown() {
+			return nil, fmt.Errorf("entry %d has an invalid rule", i)
+		}
+
+		ruleAttrs := ruleObject.Attributes()
+
+		actionValue, ok := ruleAttrs["action"].(types.String)
+		if !ok || actionValue.IsNull() || actionValue.IsUnknown() {
+			return nil, fmt.Errorf("entry %d rule has an invalid action", i)
+		}
+
+		directionValue, ok := ruleAttrs["direction"].(types.String)
+		if !ok || directionValue.IsNull() || directionValue.IsUnknown() {
+			return nil, fmt.Errorf("entry %d rule has an invalid direction", i)
+		}
+
+		icmpValue, ok := ruleAttrs["icmp"]
+		if !ok {
+			return nil, fmt.Errorf("entry %d rule does not contain ICMP criteria", i)
+		}
+
+		icmpObject, ok := icmpValue.(types.Object)
+		if !ok || icmpObject.IsNull() || icmpObject.IsUnknown() {
+			return nil, fmt.Errorf("entry %d rule has invalid ICMP criteria", i)
+		}
+
+		icmpAttrs := icmpObject.Attributes()
+
+		typeValue, ok := icmpAttrs["type"].(types.Int64)
+		if !ok || typeValue.IsNull() || typeValue.IsUnknown() {
+			return nil, fmt.Errorf("entry %d ICMP type is invalid", i)
+		}
+
+		codeValue, ok := icmpAttrs["code"].(types.Int64)
+		if !ok || codeValue.IsNull() || codeValue.IsUnknown() {
+			return nil, fmt.Errorf("entry %d ICMP code is invalid", i)
+		}
+
+		var priority *int64
+		if priorityValue, ok := ruleAttrs["priority"].(types.Int64); ok &&
+			!priorityValue.IsNull() &&
+			!priorityValue.IsUnknown() {
+			value := priorityValue.ValueInt64()
+			priority = &value
+		}
+
+		entry, err := buildICMPNWFilterEntry(
+			actionValue.ValueString(),
+			directionValue.ValueString(),
+			priority,
+			typeValue.ValueInt64(),
+			codeValue.ValueInt64(),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("entry %d: %w", i, err)
+		}
+
+		entries = append(entries, entry)
+	}
+
+	return entries, nil
+}
+
+func buildICMPNWFilterEntry(
+	action string,
+	direction string,
+	priority *int64,
+	icmpType int64,
+	icmpCode int64,
+) (libvirtxml.NWFilterEntry, error) {
+	if icmpType < 0 || icmpType > 255 {
+		return libvirtxml.NWFilterEntry{}, fmt.Errorf(
+			"ICMP type must be between 0 and 255",
+		)
+	}
+
+	if icmpCode < 0 || icmpCode > 255 {
+		return libvirtxml.NWFilterEntry{}, fmt.Errorf(
+			"ICMP code must be between 0 and 255",
+		)
+	}
+
+	typeValue := uint(icmpType)
+	codeValue := uint(icmpCode)
+
+	rule := &libvirtxml.NWFilterRule{
+		Action:    action,
+		Direction: direction,
+		ICMP: &libvirtxml.NWFilterRuleICMP{
+			Type: libvirtxml.NWFilterField{
+				Uint: &typeValue,
+			},
+			Code: libvirtxml.NWFilterField{
+				Uint: &codeValue,
+			},
+		},
+	}
+
+	if priority != nil {
+		rule.Priority = int(*priority)
+	}
+
+	return libvirtxml.NWFilterEntry{
+		Rule: rule,
+	}, nil
+}
+
 func (r *NWFilterResource) Read(
 	ctx context.Context,
 	req resource.ReadRequest,
