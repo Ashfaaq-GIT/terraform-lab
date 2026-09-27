@@ -32,3 +32,6 @@ crash.*.log
 
 # Generated Ansible inventory
 **/ansible/inventory/hosts.ini
+
+.provider-dev/
+dev.tfrc
