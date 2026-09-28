@@ -2,7 +2,10 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
+
+	libvirt "github.com/digitalocean/go-libvirt"
 
 	libvirtclient "github.com/dmacvicar/terraform-provider-libvirt/v2/internal/libvirt"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
@@ -166,6 +169,89 @@ func (r *NWFilterResource) Read(
 	req resource.ReadRequest,
 	resp *resource.ReadResponse,
 ) {
+	var model NWFilterResourceModel
+
+	resp.Diagnostics.Append(req.State.Get(ctx, &model)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	// Look up the live network filter by its Terraform name.
+	filter, err := r.client.Libvirt().NwfilterLookupByName(model.Name.ValueString())
+	if err != nil {
+		var libvirtErr libvirt.Error
+
+		// If the filter was deleted outside Terraform, remove it from state.
+		if errors.As(err, &libvirtErr) &&
+			libvirtErr.Code == uint32(libvirt.ErrNoNwfilter) {
+
+			tflog.Warn(ctx, "Network filter no longer exists", map[string]any{
+				"name": model.Name.ValueString(),
+			})
+
+			resp.State.RemoveResource(ctx)
+			return
+		}
+
+		resp.Diagnostics.AddError(
+			"Network Filter Lookup Failed",
+			fmt.Sprintf(
+				"Failed to find network filter %q: %s",
+				model.Name.ValueString(),
+				err,
+			),
+		)
+		return
+	}
+
+	// Read the live XML from libvirt.
+	xmlDoc, err := r.client.Libvirt().NwfilterGetXMLDesc(filter, 0)
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Network Filter Read Failed",
+			fmt.Sprintf(
+				"Failed to read network filter %q XML: %s",
+				model.Name.ValueString(),
+				err,
+			),
+		)
+		return
+	}
+
+	var liveFilter libvirtxml.NWFilter
+
+	if err := liveFilter.Unmarshal(xmlDoc); err != nil {
+		resp.Diagnostics.AddError(
+			"Network Filter XML Parse Failed",
+			fmt.Sprintf(
+				"Failed to parse network filter %q XML: %s",
+				model.Name.ValueString(),
+				err,
+			),
+		)
+		return
+	}
+
+	// Refresh identity and live values.
+	model.ID = types.StringValue(libvirtclient.UUIDString(filter.UUID))
+	model.Name = types.StringValue(liveFilter.Name)
+
+	// Preserve optional attributes when the user did not configure them.
+	// If configured, refresh them from live libvirt state so drift can be seen.
+	if !model.Chain.IsNull() && !model.Chain.IsUnknown() {
+		model.Chain = types.StringValue(liveFilter.Chain)
+	}
+
+	if !model.Priority.IsNull() && !model.Priority.IsUnknown() {
+		model.Priority = types.Int64Value(int64(liveFilter.Priority))
+	}
+
+	tflog.Debug(ctx, "Refreshed network filter state", map[string]any{
+		"name": model.Name.ValueString(),
+		"uuid": model.ID.ValueString(),
+	})
+
+	resp.Diagnostics.Append(resp.State.Set(ctx, &model)...)
 }
 
 // Iteration 1 currently treats schema changes as replacement.
