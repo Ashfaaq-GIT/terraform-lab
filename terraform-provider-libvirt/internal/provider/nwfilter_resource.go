@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"regexp"
+	"strconv"
 	"strings"
 
 	libvirt "github.com/digitalocean/go-libvirt"
@@ -61,10 +64,32 @@ func (r *NWFilterResource) Schema(ctx context.Context, req resource.SchemaReques
 								"direction": schema.StringAttribute{Description: "Rule direction.", Required: true},
 								"priority":  schema.Int64Attribute{Description: "Optional rule priority.", Optional: true},
 								"icmp": schema.SingleNestedAttribute{
-									Description: "ICMP match criteria.", Required: true,
+									Description: "ICMP match criteria.", Optional: true,
 									Attributes: map[string]schema.Attribute{
 										"type": schema.Int64Attribute{Description: "ICMP type.", Required: true},
 										"code": schema.Int64Attribute{Description: "ICMP code.", Required: true},
+									},
+								},
+								"tcp": schema.SingleNestedAttribute{
+									Description: "IPv4 TCP criteria including address and port ranges.", Optional: true,
+									Attributes: nwFilterIPv4Attributes(true, false),
+								},
+								"udp": schema.SingleNestedAttribute{
+									Description: "IPv4 UDP criteria including address and port ranges.", Optional: true,
+									Attributes: nwFilterIPv4Attributes(true, false),
+								},
+								"ip": schema.SingleNestedAttribute{
+									Description: "IPv4 packet criteria including optional layer-4 protocol and ports.", Optional: true,
+									Attributes: nwFilterIPv4Attributes(true, true),
+								},
+								"mac": schema.SingleNestedAttribute{
+									Description: "Ethernet source/destination MAC criteria.", Optional: true,
+									Attributes: map[string]schema.Attribute{
+										"src_mac":      schema.StringAttribute{Optional: true, Description: "Source MAC address."},
+										"src_mac_mask": schema.StringAttribute{Optional: true, Description: "Source MAC mask."},
+										"dst_mac":      schema.StringAttribute{Optional: true, Description: "Destination MAC address."},
+										"dst_mac_mask": schema.StringAttribute{Optional: true, Description: "Destination MAC mask."},
+										"protocol_id":  schema.StringAttribute{Optional: true, Description: "Optional Ethernet protocol identifier: ipv4, ipv6, arp or rarp."},
 									},
 								},
 							},
@@ -89,6 +114,27 @@ func (r *NWFilterResource) Schema(ctx context.Context, req resource.SchemaReques
 			},
 		},
 	}
+}
+
+// The same IPv4 fields apply to TCP, UDP and IPv4 rules; protocol is only
+// exposed on <ip>. Each call returns independent schema maps.
+func nwFilterIPv4Attributes(ports, protocol bool) map[string]schema.Attribute {
+	fields := map[string]schema.Attribute{
+		"src_ip":      schema.StringAttribute{Optional: true, Description: "Source IPv4 address."},
+		"src_ip_mask": schema.StringAttribute{Optional: true, Description: "Source IPv4 mask (prefix 0-32 or dotted decimal)."},
+		"dst_ip":      schema.StringAttribute{Optional: true, Description: "Destination IPv4 address."},
+		"dst_ip_mask": schema.StringAttribute{Optional: true, Description: "Destination IPv4 mask (prefix 0-32 or dotted decimal)."},
+	}
+	if ports {
+		fields["src_port_start"] = schema.Int64Attribute{Optional: true, Description: "Source port range start (0-65535)."}
+		fields["src_port_end"] = schema.Int64Attribute{Optional: true, Description: "Source port range end (0-65535)."}
+		fields["dst_port_start"] = schema.Int64Attribute{Optional: true, Description: "Destination port range start (0-65535)."}
+		fields["dst_port_end"] = schema.Int64Attribute{Optional: true, Description: "Destination port range end (0-65535)."}
+	}
+	if protocol {
+		fields["protocol"] = schema.StringAttribute{Optional: true, Description: "Layer-4 protocol: tcp, udp, udplite, esp, ah, icmp, igmp or sctp."}
+	}
+	return fields
 }
 
 func (r *NWFilterResource) Configure(ctx context.Context, req resource.ConfigureRequest, resp *resource.ConfigureResponse) {
@@ -196,33 +242,337 @@ func nwFilterEntriesFromModel(model NWFilterResourceModel) ([]libvirtxml.NWFilte
 			continue
 		}
 		ra := rule.Attributes()
-		action, ok1 := ra["action"].(types.String)
-		direction, ok2 := ra["direction"].(types.String)
-		if !ok1 || action.IsNull() || action.IsUnknown() || !ok2 || direction.IsNull() || direction.IsUnknown() {
-			return nil, fmt.Errorf("entry %d has invalid rule action or direction", i)
-		}
-		icmp, ok := ra["icmp"].(types.Object)
-		if !ok || icmp.IsNull() || icmp.IsUnknown() {
-			return nil, fmt.Errorf("entry %d has invalid ICMP criteria", i)
-		}
-		ia := icmp.Attributes()
-		typ, ok1 := ia["type"].(types.Int64)
-		code, ok2 := ia["code"].(types.Int64)
-		if !ok1 || typ.IsNull() || typ.IsUnknown() || !ok2 || code.IsNull() || code.IsUnknown() {
-			return nil, fmt.Errorf("entry %d has invalid ICMP type or code", i)
-		}
-		var priority *int64
-		if v, ok := ra["priority"].(types.Int64); ok && !v.IsNull() && !v.IsUnknown() {
-			val := v.ValueInt64()
-			priority = &val
-		}
-		converted, err := buildICMPNWFilterEntry(action.ValueString(), direction.ValueString(), priority, typ.ValueInt64(), code.ValueInt64())
+		converted, err := buildNWFilterProtocolEntry(ra)
 		if err != nil {
 			return nil, fmt.Errorf("entry %d: %w", i, err)
 		}
 		entries = append(entries, converted)
 	}
 	return entries, nil
+}
+
+// buildNWFilterProtocolEntry chooses exactly one protocol; this preserves the
+// old ICMP path while adding TCP, UDP, IPv4 and Ethernet MAC criteria.
+func buildNWFilterProtocolEntry(a map[string]attr.Value) (libvirtxml.NWFilterEntry, error) {
+	action, ok := a["action"].(types.String)
+	if !ok || action.IsNull() || action.IsUnknown() || strings.TrimSpace(action.ValueString()) == "" {
+		return libvirtxml.NWFilterEntry{}, fmt.Errorf("rule action is required")
+	}
+	direction, ok := a["direction"].(types.String)
+	if !ok || direction.IsNull() || direction.IsUnknown() || strings.TrimSpace(direction.ValueString()) == "" {
+		return libvirtxml.NWFilterEntry{}, fmt.Errorf("rule direction is required")
+	}
+	var priority *int64
+	if v, ok := a["priority"].(types.Int64); ok && !v.IsNull() && !v.IsUnknown() {
+		value := v.ValueInt64()
+		priority = &value
+	}
+	var selected string
+	var criteria types.Object
+	for _, name := range []string{"icmp", "tcp", "udp", "ip", "mac"} {
+		raw, found := a[name]
+		if !found {
+			continue
+		} // permits older unit-test object shapes
+		object, ok := raw.(types.Object)
+		if !ok || object.IsUnknown() {
+			return libvirtxml.NWFilterEntry{}, fmt.Errorf("invalid %s criteria", name)
+		}
+		if object.IsNull() {
+			continue
+		}
+		if selected != "" {
+			return libvirtxml.NWFilterEntry{}, fmt.Errorf("rule must configure exactly one protocol block (icmp, tcp, udp, ip or mac)")
+		}
+		selected, criteria = name, object
+	}
+	if selected == "" {
+		return libvirtxml.NWFilterEntry{}, fmt.Errorf("rule must configure exactly one protocol block (icmp, tcp, udp, ip or mac)")
+	}
+	attrs := criteria.Attributes()
+	if selected == "icmp" {
+		typ, ok1 := attrs["type"].(types.Int64)
+		code, ok2 := attrs["code"].(types.Int64)
+		if !ok1 || typ.IsNull() || typ.IsUnknown() || !ok2 || code.IsNull() || code.IsUnknown() {
+			return libvirtxml.NWFilterEntry{}, fmt.Errorf("invalid ICMP type or code")
+		}
+		return buildICMPNWFilterEntry(action.ValueString(), direction.ValueString(), priority, typ.ValueInt64(), code.ValueInt64())
+	}
+	rule := &libvirtxml.NWFilterRule{Action: action.ValueString(), Direction: direction.ValueString()}
+	if priority != nil {
+		rule.Priority = int(*priority)
+	}
+	switch selected {
+	case "tcp", "udp", "ip":
+		common, err := parseNWFilterIPv4(attrs)
+		if err != nil {
+			return libvirtxml.NWFilterEntry{}, err
+		}
+		ports, hasPorts, err := parseNWFilterPorts(attrs)
+		if err != nil {
+			return libvirtxml.NWFilterEntry{}, err
+		}
+		switch selected {
+		case "tcp":
+			rule.TCP = &libvirtxml.NWFilterRuleTCP{NWFilterRuleCommonIP: common, NWFilterRuleCommonPort: ports}
+		case "udp":
+			rule.UDP = &libvirtxml.NWFilterRuleUDP{NWFilterRuleCommonIP: common, NWFilterRuleCommonPort: ports}
+		case "ip":
+			protocol, present, err := nwFilterOptionalString(attrs, "protocol")
+			if err != nil {
+				return libvirtxml.NWFilterEntry{}, err
+			}
+			if present {
+				if !nwFilterAllowed(protocol, "tcp", "udp", "udplite", "esp", "ah", "icmp", "igmp", "sctp") {
+					return libvirtxml.NWFilterEntry{}, fmt.Errorf("invalid IPv4 protocol %q", protocol)
+				}
+			}
+			if hasPorts && (!present || !nwFilterAllowed(protocol, "tcp", "udp", "sctp")) {
+				return libvirtxml.NWFilterEntry{}, fmt.Errorf("IPv4 port criteria require protocol tcp, udp or sctp")
+			}
+			ipRule := &libvirtxml.NWFilterRuleIP{
+				SrcIPAddr: common.SrcIPAddr, SrcIPMask: common.SrcIPMask,
+				DstIPAddr: common.DstIPAddr, DstIPMask: common.DstIPMask,
+				NWFilterRuleCommonPort: ports,
+			}
+			if present {
+				ipRule.Protocol = libvirtxml.NWFilterField{Str: protocol}
+			}
+			rule.IP = ipRule
+		}
+	case "mac":
+		mac, err := parseNWFilterMAC(attrs)
+		if err != nil {
+			return libvirtxml.NWFilterEntry{}, err
+		}
+		rule.MAC = &mac
+	}
+	return libvirtxml.NWFilterEntry{Rule: rule}, nil
+}
+
+func nwFilterAllowed(value string, options ...string) bool {
+	for _, option := range options {
+		if value == option {
+			return true
+		}
+	}
+	return false
+}
+
+func nwFilterOptionalString(a map[string]attr.Value, name string) (string, bool, error) {
+	raw, exists := a[name]
+	if !exists {
+		return "", false, nil
+	}
+	v, ok := raw.(types.String)
+	if !ok || v.IsUnknown() {
+		return "", false, fmt.Errorf("%s must be a known string", name)
+	}
+	if v.IsNull() {
+		return "", false, nil
+	}
+	value := strings.TrimSpace(v.ValueString())
+	if value == "" {
+		return "", false, fmt.Errorf("%s cannot be blank", name)
+	}
+	return value, true, nil
+}
+
+func nwFilterOptionalPort(a map[string]attr.Value, name string) (uint, bool, error) {
+	raw, exists := a[name]
+	if !exists {
+		return 0, false, nil
+	}
+	v, ok := raw.(types.Int64)
+	if !ok || v.IsUnknown() {
+		return 0, false, fmt.Errorf("%s must be a known integer", name)
+	}
+	if v.IsNull() {
+		return 0, false, nil
+	}
+	n := v.ValueInt64()
+	if n < 0 || n > 65535 {
+		return 0, false, fmt.Errorf("%s must be between 0 and 65535", name)
+	}
+	return uint(n), true, nil
+}
+
+func parseNWFilterPorts(a map[string]attr.Value) (libvirtxml.NWFilterRuleCommonPort, bool, error) {
+	var p libvirtxml.NWFilterRuleCommonPort
+	var any bool
+	for _, side := range []string{"src", "dst"} {
+		start, hasStart, err := nwFilterOptionalPort(a, side+"_port_start")
+		if err != nil {
+			return p, false, err
+		}
+		end, hasEnd, err := nwFilterOptionalPort(a, side+"_port_end")
+		if err != nil {
+			return p, false, err
+		}
+		if hasEnd && !hasStart {
+			return p, false, fmt.Errorf("%s_port_end requires %s_port_start", side, side)
+		}
+		if hasStart && hasEnd && end < start {
+			return p, false, fmt.Errorf("%s port range end cannot be before start", side)
+		}
+		if hasStart {
+			any = true
+		}
+		if side == "src" {
+			if hasStart {
+				p.SrcPortStart = libvirtxml.NWFilterField{Uint: &start}
+			}
+			if hasEnd {
+				p.SrcPortEnd = libvirtxml.NWFilterField{Uint: &end}
+			}
+		} else {
+			if hasStart {
+				p.DstPortStart = libvirtxml.NWFilterField{Uint: &start}
+			}
+			if hasEnd {
+				p.DstPortEnd = libvirtxml.NWFilterField{Uint: &end}
+			}
+		}
+	}
+	return p, any, nil
+}
+
+func validateNWFilterMask(value string) error {
+	if n, err := strconv.Atoi(value); err == nil {
+		if n >= 0 && n <= 32 {
+			return nil
+		}
+		return fmt.Errorf("IPv4 mask prefix must be between 0 and 32")
+	}
+	ip := net.ParseIP(value).To4()
+	if ip == nil {
+		return fmt.Errorf("invalid IPv4 mask %q", value)
+	}
+	ones, bits := net.IPMask(ip).Size()
+	if bits != 32 || ones < 0 {
+		return fmt.Errorf("IPv4 mask %q is not contiguous", value)
+	}
+	return nil
+}
+
+func parseNWFilterIPv4(a map[string]attr.Value) (libvirtxml.NWFilterRuleCommonIP, error) {
+	var ip libvirtxml.NWFilterRuleCommonIP
+	for _, side := range []string{"src", "dst"} {
+		address, hasAddress, err := nwFilterOptionalString(a, side+"_ip")
+		if err != nil {
+			return ip, err
+		}
+		mask, hasMask, err := nwFilterOptionalString(a, side+"_ip_mask")
+		if err != nil {
+			return ip, err
+		}
+		if hasAddress && net.ParseIP(address).To4() == nil {
+			return ip, fmt.Errorf("invalid %s IPv4 address %q", side, address)
+		}
+		if hasMask && !hasAddress {
+			return ip, fmt.Errorf("%s_ip_mask requires %s_ip", side, side)
+		}
+		if hasMask {
+			if err := validateNWFilterMask(mask); err != nil {
+				return ip, fmt.Errorf("%s_ip_mask: %w", side, err)
+			}
+		}
+		if side == "src" {
+			if hasAddress {
+				ip.SrcIPAddr = libvirtxml.NWFilterField{Str: address}
+			}
+			if hasMask {
+				ip.SrcIPMask = libvirtxml.NWFilterField{Str: mask}
+			}
+		} else {
+			if hasAddress {
+				ip.DstIPAddr = libvirtxml.NWFilterField{Str: address}
+			}
+			if hasMask {
+				ip.DstIPMask = libvirtxml.NWFilterField{Str: mask}
+			}
+		}
+	}
+	return ip, nil
+}
+
+var nwFilterMACVariable = regexp.MustCompile(`^\$[A-Za-z_][A-Za-z0-9_]*$`)
+
+func validateNWFilterMAC(value string) error {
+	if nwFilterMACVariable.MatchString(value) {
+		return nil
+	} // libvirt parameter substitution (e.g. $MAC)
+	addr, err := net.ParseMAC(value)
+	if err != nil || len(addr) != 6 {
+		return fmt.Errorf("invalid Ethernet MAC address %q", value)
+	}
+	return nil
+}
+
+func nwFilterMACField(value string) libvirtxml.NWFilterField {
+	if nwFilterMACVariable.MatchString(value) {
+		return libvirtxml.NWFilterField{Str: value}
+	}
+	return libvirtxml.NWFilterField{Str: value}
+}
+
+func parseNWFilterMAC(a map[string]attr.Value) (libvirtxml.NWFilterRuleMAC, error) {
+	var mac libvirtxml.NWFilterRuleMAC
+	any := false
+	for _, side := range []string{"src", "dst"} {
+		address, hasAddress, err := nwFilterOptionalString(a, side+"_mac")
+		if err != nil {
+			return mac, err
+		}
+		mask, hasMask, err := nwFilterOptionalString(a, side+"_mac_mask")
+		if err != nil {
+			return mac, err
+		}
+		if hasMask && !hasAddress {
+			return mac, fmt.Errorf("%s_mac_mask requires %s_mac", side, side)
+		}
+		if hasAddress {
+			if err := validateNWFilterMAC(address); err != nil {
+				return mac, err
+			}
+			any = true
+		}
+		if hasMask {
+			if err := validateNWFilterMAC(mask); err != nil {
+				return mac, err
+			}
+		}
+		if side == "src" {
+			if hasAddress {
+				mac.SrcMACAddr = nwFilterMACField(address)
+			}
+			if hasMask {
+				mac.SrcMACMask = nwFilterMACField(mask)
+			}
+		} else {
+			if hasAddress {
+				mac.DstMACAddr = nwFilterMACField(address)
+			}
+			if hasMask {
+				mac.DstMACMask = nwFilterMACField(mask)
+			}
+		}
+	}
+	protocolID, present, err := nwFilterOptionalString(a, "protocol_id")
+	if err != nil {
+		return mac, err
+	}
+	if present {
+		if !nwFilterAllowed(protocolID, "arp", "rarp", "ipv4", "ipv6") {
+			return mac, fmt.Errorf("invalid MAC protocol_id %q", protocolID)
+		}
+		mac.ProtocolID = libvirtxml.NWFilterField{Str: protocolID}
+		any = true
+	}
+	if !any {
+		return mac, fmt.Errorf("MAC rule requires an address or protocol_id")
+	}
+	return mac, nil
 }
 
 func buildICMPNWFilterEntry(action, direction string, priority *int64, icmpType, icmpCode int64) (libvirtxml.NWFilterEntry, error) {
