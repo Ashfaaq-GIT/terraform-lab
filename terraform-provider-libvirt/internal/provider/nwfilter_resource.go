@@ -12,6 +12,7 @@ import (
 	libvirt "github.com/digitalocean/go-libvirt"
 	libvirtclient "github.com/dmacvicar/terraform-provider-libvirt/v2/internal/libvirt"
 	"github.com/hashicorp/terraform-plugin-framework/attr"
+	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
@@ -23,6 +24,7 @@ import (
 
 var _ resource.Resource = &NWFilterResource{}
 var _ resource.ResourceWithConfigure = &NWFilterResource{}
+var _ resource.ResourceWithImportState = &NWFilterResource{}
 
 type NWFilterResource struct {
 	client *libvirtclient.Client
@@ -37,6 +39,10 @@ type NWFilterResourceModel struct {
 }
 
 func NewNWFilterResource() resource.Resource { return &NWFilterResource{} }
+
+func (r *NWFilterResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
+	resource.ImportStatePassthroughID(ctx, path.Root("id"), req, resp)
+}
 
 func (r *NWFilterResource) Metadata(ctx context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
 	resp.TypeName = req.ProviderTypeName + "_nwfilter"
@@ -671,14 +677,23 @@ func (r *NWFilterResource) Read(ctx context.Context, req resource.ReadRequest, r
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	filter, err := r.client.Libvirt().NwfilterLookupByName(model.Name.ValueString())
+	lookupTarget := model.Name.ValueString()
+	var filter libvirt.Nwfilter
+	var err error
+
+	if !model.ID.IsNull() && !model.ID.IsUnknown() && model.ID.ValueString() != "" {
+		lookupTarget = model.ID.ValueString()
+		filter, err = r.client.LookupNWFilterByUUID(lookupTarget)
+	} else {
+		filter, err = r.client.Libvirt().NwfilterLookupByName(lookupTarget)
+	}
 	if err != nil {
 		var libvirtErr libvirt.Error
 		if errors.As(err, &libvirtErr) && libvirtErr.Code == uint32(libvirt.ErrNoNwfilter) {
 			resp.State.RemoveResource(ctx)
 			return
 		}
-		resp.Diagnostics.AddError("Network Filter Lookup Failed", fmt.Sprintf("Failed to find network filter %q: %s", model.Name.ValueString(), err))
+		resp.Diagnostics.AddError("Network Filter Lookup Failed", fmt.Sprintf("Failed to find network filter %q: %s", lookupTarget, err))
 		return
 	}
 	xmlDoc, err := r.client.Libvirt().NwfilterGetXMLDesc(filter, 0)
@@ -691,6 +706,7 @@ func (r *NWFilterResource) Read(ctx context.Context, req resource.ReadRequest, r
 		resp.Diagnostics.AddError("Network Filter XML Parse Failed", err.Error())
 		return
 	}
+	importing := model.Name.IsNull() || model.Name.IsUnknown()
 	model.ID = types.StringValue(libvirtclient.UUIDString(filter.UUID))
 	model.Name = types.StringValue(liveFilter.Name)
 	if !model.Chain.IsNull() && !model.Chain.IsUnknown() {
@@ -699,7 +715,11 @@ func (r *NWFilterResource) Read(ctx context.Context, req resource.ReadRequest, r
 	if !model.Priority.IsNull() && !model.Priority.IsUnknown() {
 		model.Priority = types.Int64Value(int64(liveFilter.Priority))
 	}
-	model.Entries, err = refreshNWFilterRefsFromXML(ctx, model.Entries, liveFilter.Entries)
+	if importing {
+		model.Entries, err = importNWFilterEntries(ctx, liveFilter.Entries)
+	} else {
+		model.Entries, err = refreshNWFilterRefsFromXML(ctx, model.Entries, liveFilter.Entries)
+	}
 	if err != nil {
 		resp.Diagnostics.AddError("Network Filter Reference Refresh Failed", err.Error())
 		return
