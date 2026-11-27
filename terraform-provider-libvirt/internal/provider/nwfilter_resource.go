@@ -715,10 +715,11 @@ func (r *NWFilterResource) Read(ctx context.Context, req resource.ReadRequest, r
 	if !model.Priority.IsNull() && !model.Priority.IsUnknown() {
 		model.Priority = types.Int64Value(int64(liveFilter.Priority))
 	}
-	if importing {
+	// Refresh live rule and reference entries for both imports and
+	// existing managed filters, so Terraform can detect external drift.
+	// Preserve a null entries attribute when the live filter is empty.
+	if importing || !model.Entries.IsNull() || len(liveFilter.Entries) > 0 {
 		model.Entries, err = importNWFilterEntries(ctx, liveFilter.Entries)
-	} else {
-		model.Entries, err = refreshNWFilterRefsFromXML(ctx, model.Entries, liveFilter.Entries)
 	}
 	if err != nil {
 		resp.Diagnostics.AddError("Network Filter Reference Refresh Failed", err.Error())
