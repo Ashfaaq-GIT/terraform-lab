@@ -263,3 +263,21 @@ Ansible hosts.ini generation OK
 ```
 
 Next steps will focus on Ansible and Testinfra.
+
+## Iteration 3 — Comprehensive Network Filter Management
+
+Team 5 extended the Terraform libvirt network-filter resource with
+filter import, configuration drift detection and repair, and ARP/IPv6
+protocol support.
+
+All three feature pull requests (#21, #22 and #23) were merged into
+the `sprint/iteration3` branch.
+
+**Iteration 3 documentation:**
+
+- [Sprint Overview and Team Contributions](iteration3/README.md)
+- [Terraform Usage Guide](iteration3/USAGE.md)
+- [System Architecture and Diagrams](iteration3/ARCHITECTURE.md)
+
+The two-VM, Ansible, and GUI integration results are documented
+separately as their verification is completed.
