@@ -57,6 +57,12 @@ image is present in the Git repository.
 | 24 | I3_Evidence_24_ARP_IPv6_PR_Merged.png | PR #23 merged |
 | 25 | I3_Evidence_25_ARP_IPv6_Issue_Closed.png | Issue #20 closed |
 
+## Documentation Pull Request
+
+| No. | Screenshot filename | Evidence |
+|---|---|---|
+| 26 | I3_Evidence_26_Documentation_PR_Merged.png | Documentation PR #24 merged into sprint/iteration3 |
+
 ## GitHub Evidence
 
 Repository: https://github.com/Ashfaaq-GIT/terraform-lab
@@ -64,8 +70,9 @@ Repository: https://github.com/Ashfaaq-GIT/terraform-lab
 - Import: PR #21, Issue #18.
 - Drift detection and repair: PR #22, Issue #19.
 - ARP and IPv6: PR #23, Issue #20.
+- Documentation: PR #24.
 
-All three pull requests were merged into `sprint/iteration3`.
+All four pull requests (#21–#24) were merged into `sprint/iteration3`.
 The three feature issues were closed.
 
 ## Evidence Verification Checklist
