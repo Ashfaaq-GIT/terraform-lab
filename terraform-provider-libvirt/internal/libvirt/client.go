@@ -161,6 +161,21 @@ func (c *Client) LookupNetworkByUUID(uuidStr string) (libvirt.Network, error) {
 	return network, nil
 }
 
+// LookupNWFilterByUUID finds an existing network filter by UUID.
+func (c *Client) LookupNWFilterByUUID(uuidStr string) (libvirt.Nwfilter, error) {
+	uuid, err := parseUUID(uuidStr)
+	if err != nil {
+		return libvirt.Nwfilter{}, err
+	}
+
+	filter, err := c.conn.NwfilterLookupByUUID(uuid)
+	if err != nil {
+		return libvirt.Nwfilter{}, fmt.Errorf("network filter lookup failed: %w", err)
+	}
+
+	return filter, nil
+}
+
 // parseUUID converts a UUID string to libvirt.UUID type
 func parseUUID(uuidStr string) (libvirt.UUID, error) {
 	// Remove hyphens from UUID string
