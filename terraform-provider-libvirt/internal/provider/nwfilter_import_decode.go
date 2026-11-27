@@ -55,6 +55,23 @@ func importProtocolFields(
 			a[name] = types.Int64Value(int64(*f.Uint))
 		} else if f.Str != "" {
 			n, err := strconv.ParseUint(f.Str, 10, 16)
+			if err != nil && name == "opcode" {
+				// Libvirt normalizes ARP opcodes to symbolic names in live XML.
+				opcodes := map[string]uint64{
+					"Request":         1,
+					"Reply":           2,
+					"Request_Reverse": 3,
+					"Reply_Reverse":   4,
+					"DRARP_Request":   5,
+					"DRARP_Reply":     6,
+					"DRARP_Error":     7,
+					"InARP_Request":   8,
+					"ARP_NAK":         9,
+				}
+				if value, found := opcodes[f.Str]; found {
+					n, err = value, nil
+				}
+			}
 			if err != nil {
 				return types.Object{}, fmt.Errorf(
 					"invalid decimal number for %s: %q", name, f.Str)
@@ -183,6 +200,30 @@ func importNWFilterEntries(ctx context.Context, live []libvirtxml.NWFilterEntry)
 					"src_port_end":   ports.SrcPortEnd,
 					"dst_port_start": ports.DstPortStart,
 					"dst_port_end":   ports.DstPortEnd,
+				}
+
+			case r.ARP != nil:
+				protocol = "arp"
+				textFields = map[string]libvirtxml.NWFilterField{
+					"src_mac":     r.ARP.ARPSrcMACAddr,
+					"dst_mac":     r.ARP.ARPDstMACAddr,
+					"src_ip":      r.ARP.ARPSrcIPAddr,
+					"src_ip_mask": r.ARP.ARPSrcIPMask,
+					"dst_ip":      r.ARP.ARPDstIPAddr,
+					"dst_ip_mask": r.ARP.ARPDstIPMask,
+				}
+				numberFields = map[string]libvirtxml.NWFilterField{
+					"opcode": r.ARP.OpCode,
+				}
+
+			case r.IPv6 != nil:
+				protocol = "ipv6"
+				textFields = map[string]libvirtxml.NWFilterField{
+					"src_ip":      r.IPv6.SrcIPAddr,
+					"src_ip_mask": r.IPv6.SrcIPMask,
+					"dst_ip":      r.IPv6.DstIPAddr,
+					"dst_ip_mask": r.IPv6.DstIPMask,
+					"protocol":    r.IPv6.Protocol,
 				}
 
 			case r.MAC != nil:

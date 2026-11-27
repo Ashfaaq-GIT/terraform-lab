@@ -21,6 +21,23 @@ func harithaRuleObject(t *testing.T, kind string, fields map[string]attr.Value) 
 	if kind == "ip" {
 		typeMap["protocol"] = types.StringType
 	}
+	if kind == "arp" {
+		typeMap = map[string]attr.Type{
+			"src_mac": types.StringType, "dst_mac": types.StringType,
+			"src_ip": types.StringType, "src_ip_mask": types.StringType,
+			"dst_ip": types.StringType, "dst_ip_mask": types.StringType,
+			"opcode": types.Int64Type,
+		}
+	}
+	if kind == "ipv6" {
+		typeMap = map[string]attr.Type{
+			"src_ip":      types.StringType,
+			"src_ip_mask": types.StringType,
+			"dst_ip":      types.StringType,
+			"dst_ip_mask": types.StringType,
+			"protocol":    types.StringType,
+		}
+	}
 	if kind == "mac" {
 		typeMap = map[string]attr.Type{
 			"src_mac": types.StringType, "src_mac_mask": types.StringType,

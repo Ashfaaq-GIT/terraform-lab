@@ -88,6 +88,30 @@ func (r *NWFilterResource) Schema(ctx context.Context, req resource.SchemaReques
 									Description: "IPv4 packet criteria including optional layer-4 protocol and ports.", Optional: true,
 									Attributes: nwFilterIPv4Attributes(true, true),
 								},
+								"arp": schema.SingleNestedAttribute{
+									Description: "ARP address and opcode matching criteria.",
+									Optional:    true,
+									Attributes: map[string]schema.Attribute{
+										"src_mac":     schema.StringAttribute{Optional: true},
+										"dst_mac":     schema.StringAttribute{Optional: true},
+										"src_ip":      schema.StringAttribute{Optional: true},
+										"src_ip_mask": schema.StringAttribute{Optional: true},
+										"dst_ip":      schema.StringAttribute{Optional: true},
+										"dst_ip_mask": schema.StringAttribute{Optional: true},
+										"opcode":      schema.Int64Attribute{Optional: true},
+									},
+								},
+								"ipv6": schema.SingleNestedAttribute{
+									Description: "IPv6 source, destination and protocol criteria.",
+									Optional:    true,
+									Attributes: map[string]schema.Attribute{
+										"src_ip":      schema.StringAttribute{Optional: true},
+										"src_ip_mask": schema.StringAttribute{Optional: true},
+										"dst_ip":      schema.StringAttribute{Optional: true},
+										"dst_ip_mask": schema.StringAttribute{Optional: true},
+										"protocol":    schema.StringAttribute{Optional: true},
+									},
+								},
 								"mac": schema.SingleNestedAttribute{
 									Description: "Ethernet source/destination MAC criteria.", Optional: true,
 									Attributes: map[string]schema.Attribute{
@@ -275,7 +299,7 @@ func buildNWFilterProtocolEntry(a map[string]attr.Value) (libvirtxml.NWFilterEnt
 	}
 	var selected string
 	var criteria types.Object
-	for _, name := range []string{"icmp", "tcp", "udp", "ip", "mac"} {
+	for _, name := range []string{"icmp", "tcp", "udp", "ip", "mac", "arp", "ipv6"} {
 		raw, found := a[name]
 		if !found {
 			continue
@@ -288,12 +312,12 @@ func buildNWFilterProtocolEntry(a map[string]attr.Value) (libvirtxml.NWFilterEnt
 			continue
 		}
 		if selected != "" {
-			return libvirtxml.NWFilterEntry{}, fmt.Errorf("rule must configure exactly one protocol block (icmp, tcp, udp, ip or mac)")
+			return libvirtxml.NWFilterEntry{}, fmt.Errorf("rule must configure exactly one protocol block (icmp, tcp, udp, ip, mac, arp or ipv6)")
 		}
 		selected, criteria = name, object
 	}
 	if selected == "" {
-		return libvirtxml.NWFilterEntry{}, fmt.Errorf("rule must configure exactly one protocol block (icmp, tcp, udp, ip or mac)")
+		return libvirtxml.NWFilterEntry{}, fmt.Errorf("rule must configure exactly one protocol block (icmp, tcp, udp, ip, mac, arp or ipv6)")
 	}
 	attrs := criteria.Attributes()
 	if selected == "icmp" {
@@ -346,6 +370,18 @@ func buildNWFilterProtocolEntry(a map[string]attr.Value) (libvirtxml.NWFilterEnt
 			}
 			rule.IP = ipRule
 		}
+	case "ipv6":
+		ipv6, err := parseNWFilterIPv6(attrs)
+		if err != nil {
+			return libvirtxml.NWFilterEntry{}, err
+		}
+		rule.IPv6 = &ipv6
+	case "arp":
+		arp, err := parseNWFilterARP(attrs)
+		if err != nil {
+			return libvirtxml.NWFilterEntry{}, err
+		}
+		rule.ARP = &arp
 	case "mac":
 		mac, err := parseNWFilterMAC(attrs)
 		if err != nil {
@@ -579,6 +615,127 @@ func parseNWFilterMAC(a map[string]attr.Value) (libvirtxml.NWFilterRuleMAC, erro
 		return mac, fmt.Errorf("MAC rule requires an address or protocol_id")
 	}
 	return mac, nil
+}
+
+func parseNWFilterIPv6(a map[string]attr.Value) (libvirtxml.NWFilterRuleIPv6, error) {
+	var ipv6 libvirtxml.NWFilterRuleIPv6
+	any := false
+
+	for _, side := range []string{"src", "dst"} {
+		address, hasAddress, err := nwFilterOptionalString(a, side+"_ip")
+		if err != nil {
+			return ipv6, err
+		}
+		mask, hasMask, err := nwFilterOptionalString(a, side+"_ip_mask")
+		if err != nil {
+			return ipv6, err
+		}
+
+		if hasAddress {
+			parsed := net.ParseIP(address)
+			if parsed == nil || parsed.To4() != nil {
+				return ipv6, fmt.Errorf("invalid %s IPv6 address %q", side, address)
+			}
+			any = true
+		}
+
+		if hasMask {
+			if !hasAddress {
+				return ipv6, fmt.Errorf("%s_ip_mask requires %s_ip", side, side)
+			}
+			prefix, err := strconv.Atoi(mask)
+			if err != nil || prefix < 0 || prefix > 128 {
+				return ipv6, fmt.Errorf("%s_ip_mask: IPv6 prefix must be between 0 and 128", side)
+			}
+		}
+
+		if side == "src" {
+			if hasAddress {
+				ipv6.SrcIPAddr = libvirtxml.NWFilterField{Str: address}
+			}
+			if hasMask {
+				ipv6.SrcIPMask = libvirtxml.NWFilterField{Str: mask}
+			}
+		} else {
+			if hasAddress {
+				ipv6.DstIPAddr = libvirtxml.NWFilterField{Str: address}
+			}
+			if hasMask {
+				ipv6.DstIPMask = libvirtxml.NWFilterField{Str: mask}
+			}
+		}
+	}
+
+	protocol, hasProtocol, err := nwFilterOptionalString(a, "protocol")
+	if err != nil {
+		return ipv6, err
+	}
+	if hasProtocol {
+		if !nwFilterAllowed(protocol, "tcp", "udp", "udplite", "esp", "ah", "icmpv6", "sctp") {
+			return ipv6, fmt.Errorf("invalid IPv6 protocol %q", protocol)
+		}
+		ipv6.Protocol = libvirtxml.NWFilterField{Str: protocol}
+		any = true
+	}
+
+	if !any {
+		return ipv6, fmt.Errorf("IPv6 rule requires an address or protocol")
+	}
+	return ipv6, nil
+}
+
+func parseNWFilterARP(a map[string]attr.Value) (libvirtxml.NWFilterRuleARP, error) {
+	var arp libvirtxml.NWFilterRuleARP
+	ip, err := parseNWFilterIPv4(a)
+	if err != nil {
+		return arp, err
+	}
+	arp.ARPSrcIPAddr = ip.SrcIPAddr
+	arp.ARPSrcIPMask = ip.SrcIPMask
+	arp.ARPDstIPAddr = ip.DstIPAddr
+	arp.ARPDstIPMask = ip.DstIPMask
+
+	any := ip.SrcIPAddr.Str != "" || ip.DstIPAddr.Str != ""
+
+	for _, side := range []string{"src", "dst"} {
+		value, present, err := nwFilterOptionalString(a, side+"_mac")
+		if err != nil {
+			return arp, err
+		}
+		if !present {
+			continue
+		}
+		if err := validateNWFilterMAC(value); err != nil {
+			return arp, err
+		}
+		any = true
+		if side == "src" {
+			arp.ARPSrcMACAddr = nwFilterMACField(value)
+		} else {
+			arp.ARPDstMACAddr = nwFilterMACField(value)
+		}
+	}
+
+	if raw, exists := a["opcode"]; exists {
+		value, ok := raw.(types.Int64)
+		if !ok || value.IsUnknown() {
+			return arp, fmt.Errorf("ARP opcode must be a known integer")
+		}
+		if !value.IsNull() {
+			n := value.ValueInt64()
+			if n < 1 || n > 65535 {
+				return arp, fmt.Errorf("ARP opcode must be between 1 and 65535")
+			}
+			code := uint(n)
+			arp.OpCode = libvirtxml.NWFilterField{Uint: &code}
+			any = true
+		}
+	}
+
+	if !any {
+		return arp, fmt.Errorf("ARP rule requires an address or opcode")
+	}
+	return arp, nil
 }
 
 func buildICMPNWFilterEntry(action, direction string, priority *int64, icmpType, icmpCode int64) (libvirtxml.NWFilterEntry, error) {
